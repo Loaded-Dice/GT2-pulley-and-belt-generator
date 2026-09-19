@@ -241,6 +241,11 @@ details.raw .bar{display:flex;gap:8px;margin-top:6px}
 
     <section class="group">
       <h2>DXF export</h2>
+      <div class="seg small" role="group" aria-label="Contour geometry" style="margin-bottom:6px">
+        <button type="button" data-out="arcs" aria-pressed="true">Arcs</button>
+        <button type="button" data-out="segments" aria-pressed="false">Line segments</button>
+      </div>
+      <p class="hint" id="outHint" style="font-size:13px;color:var(--muted);margin:0 0 14px"></p>
       <div class="row" data-show="pulley belt-idler belt-pulley">
         <label for="center">Center mark as</label>
         <select id="center">
@@ -257,12 +262,13 @@ details.raw .bar{display:flex;gap:8px;margin-top:6px}
       <label class="check" data-show="belt-pulley" hidden><input type="checkbox" id="expRef" checked> Include pulley (separate layer)</label>
       <label class="check"><input type="checkbox" id="expPitch"> Include pitch line</label>
       <div class="row">
-        <label for="res">Resolution</label>
+        <label for="res">Precision</label>
         <select id="res">
           <option value="1">coarse</option>
           <option value="2" selected>medium</option>
           <option value="4">fine</option>
         </select>
+        <div class="hint" id="resHint"></div>
       </div>
       <button type="button" class="primary" id="dlBtn">Download DXF</button>
       <p class="fileinfo" id="fileinfo"></p>
@@ -368,7 +374,15 @@ const GT2 = (() => {
     return out;
   }
 
-  return { P, H, h, PLD, BACK, depth, template, sample };
+  // True where the phase sits on a tangent point between two profile arcs
+  function isBreak(x){
+    let u = ((x % P) + P) % P;
+    if (u > P / 2) { u -= P; }
+    const a = Math.abs(u);
+    return Math.abs(a - xTF) < 1e-9 || Math.abs(a - xFR) < 1e-9 || Math.abs(a - xR) < 1e-9;
+  }
+
+  return { P, H, h, PLD, BACK, depth, template, sample, isBreak };
 })();
 
 const DEG = Math.PI / 180;
@@ -401,7 +415,7 @@ function offsetPoly(pts, d){
     if (l < 1e-12) { nx = n1[0]; ny = n1[1]; l = 1; }
     nx /= l; ny /= l;
     const c = Math.max(0.5, nx * n1[0] + ny * n1[1]);   // miter factor, limited
-    out[i] = [p1[0] + nx * d / c, p1[1] + ny * d / c];
+    out[i] = [p1[0] + nx * d / c, p1[1] + ny * d / c, p1[2] || 0];
   }
   return out;
 }
@@ -427,12 +441,105 @@ function removeLoops(pts, W = 80){
     const jEnd = Math.min(out.length - 1, i + W);
     for (let j = jEnd - 1; j >= i + 2; j--) {   // farthest hit first removes the whole loop
       const p = segX(a, b, out[j], out[j + 1]);
-      if (p) { hit = j; hp = p; break; }
+      if (p) { hit = j; hp = [p[0], p[1], 1]; break; }
     }
     if (hit >= 0) { out.splice(i + 1, hit - i, hp); }
     else { i++; }
   }
   return out;
+}
+
+/* ---------- arc fitting (dense polyline -> lines + true arcs as bulges) ---------- */
+
+// Circle through three points, or null if (nearly) collinear
+function circle3(a, b, c){
+  const d = 2 * (a[0] * (b[1] - c[1]) + b[0] * (c[1] - a[1]) + c[0] * (a[1] - b[1]));
+  if (Math.abs(d) < 1e-14) { return null; }
+  const a2 = a[0] * a[0] + a[1] * a[1], b2 = b[0] * b[0] + b[1] * b[1], c2 = c[0] * c[0] + c[1] * c[1];
+  const x = (a2 * (b[1] - c[1]) + b2 * (c[1] - a[1]) + c2 * (a[1] - b[1])) / d;
+  const y = (a2 * (c[0] - b[0]) + b2 * (a[0] - c[0]) + c2 * (b[0] - a[0])) / d;
+  return [x, y, Math.hypot(a[0] - x, a[1] - y)];
+}
+
+// Try to represent pts[i..j] by one line (bulge 0) or one arc; returns bulge or null
+function fitPiece(pts, i, j, tol){
+  const s = pts[i], e = pts[j];
+  if (j === i + 1) { return 0; }
+  const dx = e[0] - s[0], dy = e[1] - s[1], L = Math.hypot(dx, dy);
+  if (L < 1e-12) { return null; }
+  let lineOk = true;
+  for (let k = i + 1; k < j; k++) {
+    if (Math.abs((pts[k][0] - s[0]) * dy - (pts[k][1] - s[1]) * dx) / L > tol) { lineOk = false; break; }
+  }
+  if (lineOk) { return 0; }
+  const m = pts[(i + j) >> 1];
+  const c = circle3(s, m, e);
+  if (!c) { return null; }
+  for (let k = i + 1; k < j; k++) {
+    if (Math.abs(Math.hypot(pts[k][0] - c[0], pts[k][1] - c[1]) - c[2]) > tol) { return null; }
+  }
+  const ccw = (m[0] - s[0]) * (e[1] - m[1]) - (m[1] - s[1]) * (e[0] - m[0]) > 0;
+  const as = Math.atan2(s[1] - c[1], s[0] - c[0]), ae = Math.atan2(e[1] - c[1], e[0] - c[0]);
+  const TAU = 2 * Math.PI;
+  const sweep = ccw ? ((ae - as) % TAU + TAU) % TAU : ((as - ae) % TAU + TAU) % TAU;
+  if (sweep > Math.PI + 1e-9) { return null; }      // keep single arcs at or below 180 degrees
+  return (ccw ? 1 : -1) * Math.tan(sweep / 4);
+}
+
+// Greedy longest fit for one smooth run [i0, i1]; pushes {i, b} pieces
+function fitRun(pts, i0, i1, tol, out){
+  let i = i0;
+  while (i < i1) {
+    let good = i + 1, gb = 0, step = 1;
+    // exponential probe, then binary search for the longest valid piece
+    while (true) {
+      const j = Math.min(i + step * 2, i1);
+      const b = fitPiece(pts, i, j, tol);
+      if (b === null) { break; }
+      good = j; gb = b;
+      if (j === i1) { break; }
+      step *= 2;
+    }
+    let lo = good, hi = Math.min(i + step * 2, i1);
+    if (good < i1 && hi > lo) {
+      while (hi - lo > 1) {
+        const mid = (lo + hi) >> 1, b = fitPiece(pts, i, mid, tol);
+        if (b === null) { hi = mid; }
+        else { lo = mid; gb = b; }
+      }
+      good = lo;
+      gb = fitPiece(pts, i, good, tol);
+    }
+    out.push({ i, b: gb });
+    i = good;
+  }
+}
+
+// Convert a dense polyline into vertices + bulges (lines and arcs within tol)
+function fitPoly(src, closed, tol){
+  const n = src.length;
+  const brk = new Array(n).fill(false);
+  for (let i = 0; i < n; i++) {
+    if (src[i][2]) { brk[i] = true; continue; }
+    if (!closed && (i === 0 || i === n - 1)) { brk[i] = true; continue; }
+    const a = src[(i - 1 + n) % n], b = src[i], c = src[(i + 1) % n];
+    const v1x = b[0] - a[0], v1y = b[1] - a[1], v2x = c[0] - b[0], v2y = c[1] - b[1];
+    const cosA = (v1x * v2x + v1y * v2y) / (Math.hypot(v1x, v1y) * Math.hypot(v2x, v2y) || 1);
+    if (cosA < Math.cos(15 * DEG)) { brk[i] = true; }  // sharp corner
+  }
+  let start = brk.indexOf(true);
+  if (start < 0) { start = 0; brk[0] = true; }
+  const pts = closed ? src.slice(start).concat(src.slice(0, start), [src[start]]) : src;
+  const bk = closed ? brk.slice(start).concat(brk.slice(0, start), [true]) : brk;
+  const pieces = [];
+  let a = 0;
+  for (let i = 1; i < pts.length; i++) {
+    if (bk[i]) { fitRun(pts, a, i, tol, pieces); a = i; }
+  }
+  const outPts = pieces.map(p => [pts[p.i][0], pts[p.i][1]]);
+  const bulge = pieces.map(p => p.b);
+  if (!closed) { outPts.push([pts[pts.length - 1][0], pts[pts.length - 1][1]]); bulge.push(0); }
+  return { pts: outPts, bulge };
 }
 
 // Remove consecutive duplicates (and closing duplicate for closed loops)
@@ -441,10 +548,14 @@ function clean(pts, closed){
   for (const p of pts) {
     const q = out[out.length - 1];
     if (!q || Math.hypot(p[0] - q[0], p[1] - q[1]) > 1e-7) { out.push(p); }
+    else if (p[2]) { out[out.length - 1] = [q[0], q[1], 1]; }   // keep break flag of merged duplicate
   }
   if (closed && out.length > 2) {
     const a = out[0], b = out[out.length - 1];
-    if (Math.hypot(a[0] - b[0], a[1] - b[1]) <= 1e-7) { out.pop(); }
+    if (Math.hypot(a[0] - b[0], a[1] - b[1]) <= 1e-7) {
+      out.pop();
+      if (b[2]) { out[0] = [a[0], a[1], 1]; }
+    }
   }
   return out;
 }
@@ -465,7 +576,7 @@ function pulleyGeom(s, tmpl){
   ph.pop();   // closed loop: last sample equals first
   let pts = ph.map(x => {
     const th = x / Rp + rot, r = rOD + GT2.depth(x);
-    return [r * Math.cos(th), r * Math.sin(th)];
+    return [r * Math.cos(th), r * Math.sin(th), GT2.isBreak(x) ? 1 : 0];
   });
   if (s.offset) {
     // Two passes with rotated start so no loop can hide at the seam
@@ -518,8 +629,11 @@ function buildBeltLinear(s, tmpl){
   const L = s.len, o = s.lofs, warn = [], err = [];
   if (!(L > 0)) { return { ents: [], facts: [], warn, err: ["Length must be greater than 0."], name: "GT2_belt" }; }
   const ph = GT2.sample(o, L + o, tmpl);
-  const pts = [[0, GT2.BACK], [L, GT2.BACK]];
-  for (let i = ph.length - 1; i >= 0; i--) { pts.push([ph[i] - o, GT2.depth(ph[i])]); }
+  const pts = [[0, GT2.BACK, 1], [L, GT2.BACK, 1]];
+  for (let i = ph.length - 1; i >= 0; i--) {
+    const end = i === 0 || i === ph.length - 1;
+    pts.push([ph[i] - o, GT2.depth(ph[i]), end || GT2.isBreak(ph[i]) ? 1 : 0]);
+  }
   const ents = [
     { t: "poly", pts: clean(pts, true), closed: true, layer: "BELT", exp: true },
     { t: "line", x1: 0, y1: GT2.PLD, x2: L, y2: GT2.PLD, layer: "PITCH", exp: s.expPitch }
@@ -542,7 +656,7 @@ function wrapBelt(a0d, a1d, Rpitch, phaseOf, radiusAt, rBack, tmpl){
   const ph = GT2.sample(ph0, ph1, tmpl);
   const toothPts = ph.map(x => {
     const th = t0 + (x - ph0) / Rpitch, r = radiusAt(x);
-    return [r * Math.cos(th), r * Math.sin(th)];
+    return [r * Math.cos(th), r * Math.sin(th), GT2.isBreak(x) ? 1 : 0];
   });
   const ents = [];
   if (full) {
@@ -551,6 +665,9 @@ function wrapBelt(a0d, a1d, Rpitch, phaseOf, radiusAt, rBack, tmpl){
   }
   else {
     const back = arcPts(0, 0, rBack, t1, t0);
+    // belt end corners
+    toothPts[0][2] = 1; toothPts[toothPts.length - 1][2] = 1;
+    back[0][2] = 1; back[back.length - 1][2] = 1;
     ents.push({ t: "poly", pts: clean(toothPts.concat(back), true), closed: true, layer: "BELT", exp: true });
   }
   return { ents, full, span: full ? 360 : span };
@@ -652,7 +769,11 @@ function toDxf(ents){
     switch (e.t) {
       case "poly":
         w(0, "POLYLINE"); w(8, e.layer); w(66, 1); w(10, f(0)); w(20, f(0)); w(30, f(0)); w(70, e.closed ? 1 : 0);
-        for (const p of e.pts) { w(0, "VERTEX"); w(8, e.layer); w(10, f(p[0])); w(20, f(p[1])); w(30, f(0)); }
+        e.pts.forEach((p, k) => {
+          w(0, "VERTEX"); w(8, e.layer); w(10, f(p[0])); w(20, f(p[1])); w(30, f(0));
+          const b = e.bulge ? e.bulge[k] : 0;
+          if (Math.abs(b) > 1e-12) { w(42, b.toFixed(9)); }
+        });
         w(0, "SEQEND"); w(8, e.layer);
         break;
       case "circle": w(0, "CIRCLE"); w(8, e.layer); w(10, f(e.cx)); w(20, f(e.cy)); w(30, f(0)); w(40, f(e.r)); break;
@@ -752,7 +873,7 @@ const st = {
   idlerD: 12, ia0: 0, ia1: 180, iofs: 0,
   pa0: 0, pa1: 180,
   center: "point", centerD: 1, expPitch: false, expRef: true, expIdler: true,
-  res: 2
+  res: 2, output: "arcs"
 };
 let model = null;
 let view = { x: 0, y: 0, s: 20 };     // world center + pixels per mm
@@ -789,6 +910,9 @@ for (const k of ["expPitch", "expRef", "expIdler"]) {
 document.querySelectorAll("[data-mode]").forEach(b => b.addEventListener("click", () => {
   st.mode = b.dataset.mode; userMoved = false; update();
 }));
+document.querySelectorAll("[data-out]").forEach(b => b.addEventListener("click", () => {
+  st.output = b.dataset.out; update();
+}));
 document.querySelectorAll("[data-belt]").forEach(b => b.addEventListener("click", () => {
   st.belt = b.dataset.belt; userMoved = false; update();
 }));
@@ -797,6 +921,7 @@ function syncChrome(){
   const key = modeKey();
   document.querySelectorAll("[data-mode]").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.mode === st.mode)));
   document.querySelectorAll("[data-belt]").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.belt === st.belt)));
+  document.querySelectorAll("[data-out]").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.out === st.output)));
   document.querySelectorAll("[data-show]").forEach(el => {
     const tags = el.dataset.show.split(" ");
     el.hidden = !(tags.includes(key) || tags.includes(st.mode));
@@ -808,21 +933,39 @@ function update(){
   syncChrome();
   const s = { ...st, teeth: Math.max(8, Math.min(300, st.teeth | 0)), offset: Math.max(-0.3, Math.min(0.3, st.offset)),
     lofs: Math.max(0, Math.min(2, st.lofs)), iofs: Math.max(0, Math.min(2, st.iofs)), centerD: Math.max(0.01, st.centerD) };
-  const tmpl = GT2.template(s.res);
+  const arcs = st.output === "arcs";
+  const tmpl = GT2.template(arcs ? 8 : s.res);     // arcs: dense source, precision via tolerance
   const key = modeKey();
   if (key === "pulley") { model = buildPulley(s, tmpl); }
   else if (key === "belt-linear") { model = buildBeltLinear(s, tmpl); }
   else if (key === "belt-idler") { model = buildBeltIdler(s, tmpl); }
   else { model = buildBeltPulley(s, tmpl); }
   if (st.teeth < 8 || st.teeth > 300) { model.warn.push("Tooth count is limited to 8 to 300."); }
+  if (arcs) {
+    const tol = { 1: 0.005, 2: 0.001, 4: 0.0002 }[s.res] || 0.001;
+    for (const e of model.ents) {
+      if (e.t !== "poly") { continue; }
+      const fp = fitPoly(e.pts, e.closed, tol);
+      e.pts = fp.pts; e.bulge = fp.bulge;
+    }
+  }
 
   $("facts").innerHTML = model.facts.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
   $("warn").textContent = model.warn.join(" ");
   $("err").textContent = model.err.join(" ");
   $("dlBtn").disabled = model.err.length > 0;
-  const nPts = model.ents.filter(e => e.exp && e.t === "poly").reduce((a, e) => a + e.pts.length, 0);
+  const polys = model.ents.filter(e => e.exp && e.t === "poly");
+  const nPts = polys.reduce((a, e) => a + e.pts.length, 0);
+  const nArc = polys.reduce((a, e) => a + (e.bulge ? e.bulge.filter(b => Math.abs(b) > 1e-12).length : 0), 0);
   const layers = [...new Set(model.ents.filter(e => e.exp).map(e => e.layer))];
-  $("fileinfo").textContent = model.err.length ? "" : `${model.name}.dxf, ${nPts} contour points, layers: ${layers.join(", ")}`;
+  const geo = arcs ? `${nArc} arcs, ${nPts - nArc} lines` : `${nPts} line segments`;
+  $("fileinfo").textContent = model.err.length ? "" : `${model.name}.dxf, ${geo}, layers: ${layers.join(", ")}`;
+  $("outHint").textContent = arcs
+    ? "Best for modern CAD: few true arcs, fast to project, radii can be dimensioned."
+    : "Best for direct CNC/laser cutting and older software: plain line segments only.";
+  $("resHint").textContent = arcs
+    ? `Max. deviation from the ideal profile: ${{ 1: "5", 2: "1", 4: "0.2" }[s.res] || "1"} µm.`
+    : "Number of line segments per tooth.";
   $("status").textContent = "";
   if ($("raw").open) { $("rawText").value = model.err.length ? "" : toDxf(model.ents); }
 
@@ -848,7 +991,19 @@ const NAMES = { PULLEY: "Pulley", BELT: "Belt", PULLEY_REF: "Pulley (reference)"
 function pathOf(e){
   const n = v => v.toFixed(4);
   switch (e.t) {
-    case "poly": return "M" + e.pts.map(p => n(p[0]) + " " + n(p[1])).join("L") + (e.closed ? "Z" : "");
+    case "poly": {
+      if (!e.bulge) { return "M" + e.pts.map(p => n(p[0]) + " " + n(p[1])).join("L") + (e.closed ? "Z" : ""); }
+      const P = e.pts, cnt = e.closed ? P.length : P.length - 1;
+      let d = `M${n(P[0][0])} ${n(P[0][1])}`;
+      for (let k = 0; k < cnt; k++) {
+        const a = P[k], b = P[(k + 1) % P.length], bu = e.bulge[k];
+        if (Math.abs(bu) < 1e-12) { d += `L${n(b[0])} ${n(b[1])}`; continue; }
+        const chord = Math.hypot(b[0] - a[0], b[1] - a[1]);
+        const r = chord * (1 + bu * bu) / (4 * Math.abs(bu));
+        d += `A${n(r)} ${n(r)} 0 ${Math.abs(bu) > 1 ? 1 : 0} ${bu > 0 ? 1 : 0} ${n(b[0])} ${n(b[1])}`;
+      }
+      return d + (e.closed ? "Z" : "");
+    }
     case "circle": return `M${n(e.cx + e.r)} ${n(e.cy)}A${n(e.r)} ${n(e.r)} 0 1 0 ${n(e.cx - e.r)} ${n(e.cy)}A${n(e.r)} ${n(e.r)} 0 1 0 ${n(e.cx + e.r)} ${n(e.cy)}Z`;
     case "arc": {
       const pts = arcPts(e.cx, e.cy, e.r, e.a0 * DEG, Math.min(e.a1, e.a0 + 360) * DEG);
