@@ -143,10 +143,27 @@ details.raw .bar{display:flex;gap:8px;margin-top:6px}
       <h2 data-show="belt-pulley">Pulley (reference)</h2>
       <div class="row">
         <label for="teeth">Teeth</label>
-        <div class="num"><input id="teeth" type="number" min="8" max="300" step="1" value="20"><span class="u">T</span></div>
+        <div class="num"><input id="teeth" type="number" min="8" max="2000" step="1" value="20"><span class="u">T</span></div>
         <input id="teeth_r" type="range" min="8" max="120" step="1" value="20" aria-label="Teeth">
       </div>
-      <div class="row">
+      <div class="seg small" role="group" aria-label="Pulley extent" style="margin:0 0 12px">
+        <button type="button" data-sector="full" aria-pressed="true">Full circle</button>
+        <button type="button" data-sector="sector" aria-pressed="false">Sector</button>
+      </div>
+      <div class="row" id="sa0Row" hidden>
+        <label for="sa0">Start angle</label>
+        <div class="num"><input id="sa0" type="number" step="1" value="0"><span class="u">°</span></div>
+      </div>
+      <div class="row" id="sa1Row" hidden>
+        <label for="sa1">End angle</label>
+        <div class="num"><input id="sa1" type="number" step="1" value="90"><span class="u">°</span></div>
+      </div>
+      <div class="row" id="innerRow" hidden>
+        <label for="innerD">Inner Ø</label>
+        <div class="num"><input id="innerD" type="number" min="0" step="0.5" value="0"><span class="u">mm</span></div>
+        <div class="hint">0 closes the sector towards the center, any other value cuts it as a ring segment.</div>
+      </div>
+      <div class="row" id="boreRow">
         <label for="hole">Bore</label>
         <select id="hole">
           <option value="0">none</option>
@@ -401,7 +418,7 @@ function arcPts(cx, cy, r, t0, t1){
 }
 
 // Offset a closed CCW polygon along vertex normals (d > 0 grows outward)
-function offsetPoly(pts, d){
+function offsetPoly(pts, d, closed = true){
   if (!d) { return pts; }
   const n = pts.length, out = new Array(n);
   const nrm = (a, b) => {
@@ -409,8 +426,11 @@ function offsetPoly(pts, d){
     return [dy / l, -dx / l];
   };
   for (let i = 0; i < n; i++) {
-    const p0 = pts[(i - 1 + n) % n], p1 = pts[i], p2 = pts[(i + 1) % n];
-    const n1 = nrm(p0, p1), n2 = nrm(p1, p2);
+    const p1 = pts[i];
+    const p0 = closed ? pts[(i - 1 + n) % n] : pts[Math.max(0, i - 1)];
+    const p2 = closed ? pts[(i + 1) % n] : pts[Math.min(n - 1, i + 1)];
+    const n1 = i === 0 && !closed ? nrm(p1, p2) : nrm(p0, p1);
+    const n2 = i === n - 1 && !closed ? nrm(p0, p1) : nrm(p1, p2);
     let nx = n1[0] + n2[0], ny = n1[1] + n2[1], l = Math.hypot(nx, ny);
     if (l < 1e-12) { nx = n1[0]; ny = n1[1]; l = 1; }
     nx /= l; ny /= l;
@@ -572,20 +592,48 @@ function pulleyGeom(s, tmpl){
   const N = s.teeth, P = GT2.P;
   const Rp = N * P / (2 * Math.PI), rOD = Rp - GT2.PLD, rRoot = rOD - GT2.h;
   const rot = s.rot * DEG;
-  const ph = GT2.sample(0, N * P, tmpl);
-  ph.pop();   // closed loop: last sample equals first
-  let pts = ph.map(x => {
+  const span = s.sector ? Math.min(Math.max(s.sa1 - s.sa0, 0), 360) : 360;
+  const sector = s.sector && span < 360 - 1e-9;
+  const toothAt = x => {
     const th = x / Rp + rot, r = rOD + GT2.depth(x);
     return [r * Math.cos(th), r * Math.sin(th), GT2.isBreak(x) ? 1 : 0];
-  });
+  };
+
+  if (!sector) {
+    const ph = GT2.sample(0, N * P, tmpl);
+    ph.pop();   // closed loop: last sample equals first
+    let pts = ph.map(toothAt);
+    if (s.offset) {
+      // Two passes with rotated start so no loop can hide at the seam
+      pts = removeLoops(offsetPoly(pts, s.offset));
+      const m = pts.length >> 1;
+      pts = removeLoops(pts.slice(m).concat(pts.slice(0, m)));
+    }
+    return { N, Rp, rOD, rRoot, rot, span: 360, sector: false, rIn: 0, pts: clean(pts, true) };
+  }
+
+  // Sector: toothed arc from start to end angle, closed towards the center or an inner arc
+  const t0 = s.sa0 * DEG, t1 = (s.sa0 + span) * DEG;
+  const ph0 = (t0 - rot) * Rp, ph1 = (t1 - rot) * Rp;
+  let tooth = GT2.sample(ph0, ph1, tmpl).map(toothAt);
+  if (s.offset) { tooth = removeLoops(offsetPoly(tooth, s.offset, false)); }
+  tooth = clean(tooth, false);
+  tooth[0][2] = 1; tooth[tooth.length - 1][2] = 1;   // cut edges are corners
+  const rIn = Math.max(0, s.innerD / 2);
+  let pts;
+  if (rIn > 1e-9) {
+    const inner = arcPts(0, 0, rIn, t1, t0);
+    inner[0][2] = 1; inner[inner.length - 1][2] = 1;
+    pts = tooth.concat(inner);
+  }
+  else { pts = tooth.concat([[0, 0, 1]]); }
   if (s.offset) {
-    // Two passes with rotated start so no loop can hide at the seam
-    pts = removeLoops(offsetPoly(pts, s.offset));
+    // the offset can push the cut edges into the profile, so clean the closed outline as well
+    pts = removeLoops(pts);
     const m = pts.length >> 1;
     pts = removeLoops(pts.slice(m).concat(pts.slice(0, m)));
   }
-  pts = clean(pts, true);
-  return { N, Rp, rOD, rRoot, rot, pts };
+  return { N, Rp, rOD, rRoot, rot, span, sector: true, rIn, pts: clean(pts, true) };
 }
 
 function centerEnts(s, cx, cy){
@@ -598,10 +646,13 @@ function centerEnts(s, cx, cy){
 function holeDia(s){ return s.hole === "custom" ? s.holeCustom : parseFloat(s.hole); }
 
 function buildPulley(s, tmpl){
-  const g = pulleyGeom(s, tmpl);
-  const ents = [{ t: "poly", pts: g.pts, closed: true, layer: "PULLEY", exp: true }];
   const warn = [], err = [];
-  const hd = holeDia(s);
+  if (s.sector && !(s.sa1 > s.sa0)) { return { ents: [], facts: [], warn, err: ["End angle must be greater than start angle."], name: "GT2_pulley" }; }
+  const g = pulleyGeom(s, tmpl);
+  if (g.sector && g.rIn > 0 && g.rIn >= g.rRoot + s.offset) { err.push(`Inner Ø must stay below the root circle (Ø ${fmt(2 * (g.rRoot + s.offset))} mm).`); }
+  if (s.sector && s.sa1 - s.sa0 > 360) { warn.push("Angle range above 360° was limited to a full circle."); }
+  const ents = [{ t: "poly", pts: g.pts, closed: true, layer: "PULLEY", exp: true }];
+  const hd = g.sector ? 0 : holeDia(s);
   if (hd > 0) {
     ents.push({ t: "circle", cx: 0, cy: 0, r: hd / 2, layer: "PULLEY", exp: true });
     const wall = g.rRoot + s.offset - hd / 2;
@@ -609,7 +660,9 @@ function buildPulley(s, tmpl){
     else if (wall < 1) { warn.push(`Remaining wall below the grooves is only ${fmt(wall)} mm.`); }
   }
   if (!isFinite(hd) || hd < 0) { err.push("Bore diameter is invalid."); }
-  ents.push({ t: "arc", cx: 0, cy: 0, r: g.Rp, a0: 0, a1: 360, layer: "PITCH", exp: s.expPitch });
+  ents.push(g.sector
+    ? { t: "arc", cx: 0, cy: 0, r: g.Rp, a0: s.sa0, a1: s.sa0 + g.span, layer: "PITCH", exp: s.expPitch }
+    : { t: "arc", cx: 0, cy: 0, r: g.Rp, a0: 0, a1: 360, layer: "PITCH", exp: s.expPitch });
   ents.push(...centerEnts(s, 0, 0));
   const P = GT2.P;
   const facts = [
@@ -620,9 +673,18 @@ function buildPulley(s, tmpl){
     ["Outer circumference", fmt(Math.PI * 2 * (g.rOD + s.offset), 2) + " mm"],
     ["Belt travel per rev", fmt(g.N * P, 1) + " mm"]
   ];
+  if (g.sector) {
+    const arcLen = g.Rp * g.span * DEG;
+    facts.splice(3, 3,
+      ["Sector angle", fmt(g.span, 1) + "°"],
+      ["Teeth in sector", fmt(arcLen / P, 2)],
+      ["Arc length (pitch line)", fmt(arcLen, 2) + " mm"],
+      ["Inner boundary", g.rIn > 0 ? "Ø " + fmt(2 * g.rIn, 2) + " mm" : "center"]);
+  }
   if (s.offset) { warn.push(`Profile offset of ${s.offset > 0 ? "+" : ""}${fmt(s.offset)} mm is included in outer and root diameter.`); }
   const hs = hd > 0 ? `_bore${String(+hd.toFixed(2)).replace(".", "-")}` : "";
-  return { ents, facts, warn, err, name: `GT2_pulley_${g.N}T${hs}` };
+  const ss = g.sector ? `_${Math.round(s.sa0)}-${Math.round(s.sa0 + g.span)}deg` : "";
+  return { ents, facts, warn, err, name: `GT2_pulley_${g.N}T${ss}${hs}` };
 }
 
 function buildBeltLinear(s, tmpl){
@@ -709,7 +771,7 @@ function buildBeltPulley(s, tmpl){
   const warn = [], err = [];
   if (!(s.pa1 > s.pa0)) { err.push("End angle must be greater than start angle."); }
   if (err.length) { return { ents: [], facts: [], warn, err, name: "GT2_belt" }; }
-  const g = pulleyGeom(s, tmpl);
+  const g = pulleyGeom({ ...s, sector: false }, tmpl);
   const rLand = g.Rp - GT2.PLD;
   const w = wrapBelt(s.pa0, s.pa1, g.Rp, t => (t - g.rot) * g.Rp, x => rLand + GT2.depth(x), rLand + GT2.BACK, tmpl);
   if (s.pa1 - s.pa0 > 360) { warn.push("Angle range above 360° was limited to a closed ring."); }
@@ -869,6 +931,7 @@ const $ = id => document.getElementById(id);
 const st = {
   mode: "pulley", belt: "linear",
   teeth: 20, hole: "5", holeCustom: 5, rot: 0, offset: 0,
+  sector: false, sa0: 0, sa1: 90, innerD: 0,
   len: 20, lofs: 0,
   idlerD: 12, ia0: 0, ia1: 180, iofs: 0,
   pa0: 0, pa1: 180,
@@ -879,10 +942,21 @@ let model = null;
 let view = { x: 0, y: 0, s: 20 };     // world center + pixels per mm
 let userMoved = false;
 
+// Rough number of tooth pitches the current contour will contain
+function estPitches(s, key){
+  if (key === "pulley") { return s.teeth * (s.sector ? Math.min(Math.max(s.sa1 - s.sa0, 0), 360) / 360 : 1); }
+  if (key === "belt-linear") { return Math.abs(s.len) / GT2.P; }
+  if (key === "belt-idler") {
+    const span = Math.min(Math.max(s.ia1 - s.ia0, 0), 360);
+    return (s.idlerD / 2 + GT2.BACK - GT2.PLD) * span * DEG / GT2.P;
+  }
+  return s.teeth;   // belt around pulley: the reference pulley is the longest contour
+}
+
 function modeKey(){ return st.mode === "pulley" ? "pulley" : "belt-" + st.belt; }
 
 // Number inputs (optionally paired with range sliders)
-const numKeys = ["teeth", "holeCustom", "rot", "offset", "len", "lofs", "idlerD", "ia0", "ia1", "iofs", "pa0", "pa1", "centerD"];
+const numKeys = ["teeth", "holeCustom", "rot", "offset", "sa0", "sa1", "innerD", "len", "lofs", "idlerD", "ia0", "ia1", "iofs", "pa0", "pa1", "centerD"];
 for (const k of numKeys) {
   const el = $(k), rng = $(k + "_r");
   el.addEventListener("input", () => {
@@ -901,7 +975,7 @@ for (const k of numKeys) {
     });
   }
 }
-$("hole").addEventListener("change", () => { st.hole = $("hole").value; $("holeCustomRow").hidden = st.hole !== "custom"; update(); });
+$("hole").addEventListener("change", () => { st.hole = $("hole").value; update(); });
 $("center").addEventListener("change", () => { st.center = $("center").value; update(); });
 $("res").addEventListener("change", () => { st.res = parseInt($("res").value, 10); update(); });
 for (const k of ["expPitch", "expRef", "expIdler"]) {
@@ -909,6 +983,9 @@ for (const k of ["expPitch", "expRef", "expIdler"]) {
 }
 document.querySelectorAll("[data-mode]").forEach(b => b.addEventListener("click", () => {
   st.mode = b.dataset.mode; userMoved = false; update();
+}));
+document.querySelectorAll("[data-sector]").forEach(b => b.addEventListener("click", () => {
+  st.sector = b.dataset.sector === "sector"; userMoved = false; update();
 }));
 document.querySelectorAll("[data-out]").forEach(b => b.addEventListener("click", () => {
   st.output = b.dataset.out; update();
@@ -922,27 +999,37 @@ function syncChrome(){
   document.querySelectorAll("[data-mode]").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.mode === st.mode)));
   document.querySelectorAll("[data-belt]").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.belt === st.belt)));
   document.querySelectorAll("[data-out]").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.out === st.output)));
+  document.querySelectorAll("[data-sector]").forEach(b => b.setAttribute("aria-pressed", String((b.dataset.sector === "sector") === st.sector)));
   document.querySelectorAll("[data-show]").forEach(el => {
     const tags = el.dataset.show.split(" ");
     el.hidden = !(tags.includes(key) || tags.includes(st.mode));
   });
+  const sect = key === "pulley" && st.sector;
+  for (const id of ["sa0Row", "sa1Row", "innerRow"]) { $(id).hidden = !sect; }
+  if (sect) { $("boreRow").hidden = true; }
+  $("holeCustomRow").hidden = st.hole !== "custom" || sect || !(key === "pulley" || key === "belt-pulley");
   $("centerDRow").hidden = st.center === "point" || key === "belt-linear";
 }
 
 function update(){
   syncChrome();
-  const s = { ...st, teeth: Math.max(8, Math.min(300, st.teeth | 0)), offset: Math.max(-0.3, Math.min(0.3, st.offset)),
+  const s = { ...st, teeth: Math.max(8, Math.min(2000, st.teeth | 0)), offset: Math.max(-0.3, Math.min(0.3, st.offset)),
     lofs: Math.max(0, Math.min(2, st.lofs)), iofs: Math.max(0, Math.min(2, st.iofs)), centerD: Math.max(0.01, st.centerD) };
   const arcs = st.output === "arcs";
-  const tmpl = GT2.template(arcs ? 8 : s.res);     // arcs: dense source, precision via tolerance
   const key = modeKey();
+  // arcs: dense source (precision comes from the fit tolerance), thinned out for very long contours
+  const pitches = estPitches(s, key);
+  const q = pitches <= 350 ? 8 : pitches <= 1200 ? 4 : 2;
+  const tmpl = GT2.template(arcs ? q : s.res);
   if (key === "pulley") { model = buildPulley(s, tmpl); }
   else if (key === "belt-linear") { model = buildBeltLinear(s, tmpl); }
   else if (key === "belt-idler") { model = buildBeltIdler(s, tmpl); }
   else { model = buildBeltPulley(s, tmpl); }
-  if (st.teeth < 8 || st.teeth > 300) { model.warn.push("Tooth count is limited to 8 to 300."); }
+  if (st.teeth < 8 || st.teeth > 2000) { model.warn.push("Tooth count is limited to 8 to 2000."); }
+  let tol = { 1: 0.005, 2: 0.001, 4: 0.0002 }[s.res] || 0.001;
+  // a thinned source cannot support the finest tolerance, so keep the stated value honest
+  tol = Math.max(tol, q === 8 ? 0 : q === 4 ? 0.0005 : 0.002);
   if (arcs) {
-    const tol = { 1: 0.005, 2: 0.001, 4: 0.0002 }[s.res] || 0.001;
     for (const e of model.ents) {
       if (e.t !== "poly") { continue; }
       const fp = fitPoly(e.pts, e.closed, tol);
@@ -964,7 +1051,7 @@ function update(){
     ? "Best for modern CAD: few true arcs, fast to project, radii can be dimensioned."
     : "Best for direct CNC/laser cutting and older software: plain line segments only.";
   $("resHint").textContent = arcs
-    ? `Max. deviation from the ideal profile: ${{ 1: "5", 2: "1", 4: "0.2" }[s.res] || "1"} µm.`
+    ? `Max. deviation from the ideal profile: ${+(tol * 1000).toFixed(1)} µm.`
     : "Number of line segments per tooth.";
   $("status").textContent = "";
   if ($("raw").open) { $("rawText").value = model.err.length ? "" : toDxf(model.ents); }
